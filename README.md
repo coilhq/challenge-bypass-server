@@ -23,7 +23,7 @@ This is a TCP server that is compatible with the [Privacy Pass](https://github.c
 
 To run the server:
 
-`go run server/main.go --key testdata/p256-key.pem --comm testdata/test-p256-commitment`
+`go run cmd/server/main.go --key testdata/p256-key.pem --comm testdata/test-p256-commitment`
 
 here, `key` is the current secret key used for signing, `comm` is the public commitment to the signing key.
 

@@ -1,16 +1,15 @@
-package main
+package server
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/privacypass/challenge-bypass-server"
@@ -34,39 +33,19 @@ var (
 )
 
 type Server struct {
-	BindAddress        string `json:"bind_address,omitempty"`
-	ListenPort         int    `json:"listen_port,omitempty"`
-	MetricsPort        int    `json:"metrics_port,omitempty"`
-	MaxTokens          int    `json:"max_tokens,omitempty"`
-	SignKeyFilePath    string `json:"key_file_path"`
-	RedeemKeysFilePath string `json:"redeem_keys_file_path"`
-	CommFilePath       string `json:"comm_file_path"`
+	BindAddress string
+	ListenPort  int
+	MetricsPort int
+	MaxTokens   int
 
 	signKey    []byte        // a big-endian marshaled big.Int representing an elliptic curve scalar for the current signing key
 	redeemKeys [][]byte      // current signing key + all old keys
-	G          *crypto.Point // elliptic curve point representation of generator G
-	H          *crypto.Point // elliptic curve point representation of commitment H to signing key
-	keyVersion string        // the version of the key that is used
-}
+	g          *crypto.Point // elliptic curve point representation of generator G
+	h          *crypto.Point // elliptic curve point representation of commitment H to signing key
+	KeyVersion string        // the version of the key that is used
 
-var DefaultServer = &Server{
-	BindAddress: "127.0.0.1",
-	ListenPort:  2416,
-	MetricsPort: 2417,
-	MaxTokens:   100,
-}
-
-func loadConfigFile(filePath string) (Server, error) {
-	conf := *DefaultServer
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return conf, err
-	}
-	err = json.Unmarshal(data, conf)
-	if err != nil {
-		return conf, err
-	}
-	return conf, nil
+	// Guards signKey, redeemKeys, g, h.
+	mutex sync.RWMutex
 }
 
 // return nil to exit without complaint, caller closes
@@ -104,10 +83,13 @@ func (c *Server) handle(conn *net.TCPConn) error {
 		return err
 	}
 
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	switch request.Type {
 	case btd.ISSUE:
 		metrics.CounterIssueTotal.Inc()
-		err = btd.HandleIssue(conn, request, c.signKey, c.keyVersion, c.G, c.H, c.MaxTokens)
+		err = btd.HandleIssue(conn, request, c.signKey, c.KeyVersion, c.g, c.h, c.MaxTokens)
 		if err != nil {
 			metrics.CounterIssueError.Inc()
 			return err
@@ -129,31 +111,59 @@ func (c *Server) handle(conn *net.TCPConn) error {
 	}
 }
 
-// loadKeys loads a signing key and optionally loads a file containing old keys for redemption validation
-func (c *Server) loadKeys() error {
-	if c.SignKeyFilePath == "" {
+// LoadKeys loads a signing key and optionally loads a file containing old keys for redemption validation
+func (c *Server) LoadKeys(
+	signKeyFile string,
+	commFile string,
+	redeemKeysFile string, // optional
+) error {
+	if signKeyFile == "" {
 		return ErrEmptyKeyPath
-	} else if c.CommFilePath == "" {
+	} else if commFile == "" {
 		return ErrEmptyCommPath
 	}
 
 	// Parse current signing key
-	_, currkey, err := crypto.ParseKeyFile(c.SignKeyFilePath, true)
+	_, currkey, err := crypto.ParseKeyFile(signKeyFile, true)
 	if err != nil {
 		return err
 	}
-	c.signKey = currkey[0]
-	c.redeemKeys = append(c.redeemKeys, c.signKey)
+	var redeemKeys [][]byte
+	signKey := currkey[0]
+	redeemKeys = append(redeemKeys, signKey)
 
 	// optionally parse old keys that are valid for redemption
-	if c.RedeemKeysFilePath != "" {
+	if redeemKeysFile != "" {
 		errLog.Println("Adding extra keys for verifying token redemptions")
-		_, oldKeys, err := crypto.ParseKeyFile(c.RedeemKeysFilePath, false)
+		_, oldKeys, err := crypto.ParseKeyFile(redeemKeysFile, false)
 		if err != nil {
 			return err
 		}
-		c.redeemKeys = append(c.redeemKeys, oldKeys...)
+		redeemKeys = append(redeemKeys, oldKeys...)
 	}
+
+	// Get bytes for public commitment to private key
+	GBytes, HBytes, err := crypto.ParseCommitmentFile(commFile)
+	if err != nil {
+		return err
+	}
+
+	// Retrieve the actual elliptic curve points for the commitment
+	// The commitment should match the current key that is being used for
+	// signing
+	//
+	// We only support curve point commitments for P256-SHA256
+	G, H, err := crypto.RetrieveCommPoints(GBytes, HBytes, signKey)
+	if err != nil {
+		return err
+	}
+
+	c.mutex.Lock()
+	c.signKey = signKey
+	c.redeemKeys = redeemKeys
+	c.g = G
+	c.h = H
+	c.mutex.Unlock()
 
 	return nil
 }
@@ -222,66 +232,5 @@ func (c *Server) ListenAndServe() error {
 			errorChannel <- c.handle(tcpConn)
 			tcpConn.Close()
 		}()
-	}
-}
-
-func main() {
-	var configFile string
-	var err error
-	srv := *DefaultServer
-
-	flag.StringVar(&configFile, "config", "", "local config file for development (overrides cli options)")
-	flag.StringVar(&srv.BindAddress, "addr", "127.0.0.1", "address to listen on")
-	flag.StringVar(&srv.SignKeyFilePath, "key", "", "path to the current secret key file for signing tokens")
-	flag.StringVar(&srv.RedeemKeysFilePath, "redeem_keys", "", "(optional) path to the file containing all other keys that are still used for validating redemptions")
-	flag.StringVar(&srv.CommFilePath, "comm", "", "path to the commitment file")
-	flag.IntVar(&srv.ListenPort, "p", 2416, "port to listen on")
-	flag.IntVar(&srv.MetricsPort, "m", 2417, "metrics port")
-	flag.IntVar(&srv.MaxTokens, "maxtokens", 100, "maximum number of tokens issued per request")
-	flag.StringVar(&srv.keyVersion, "keyversion", "1.0", "version sent to the client for choosing consistent key commitments for proof verification")
-	flag.Parse()
-
-	if configFile != "" {
-		srv, err = loadConfigFile(configFile)
-		if err != nil {
-			errLog.Fatal(err)
-			return
-		}
-	}
-
-	if configFile == "" && (srv.SignKeyFilePath == "" || srv.CommFilePath == "") {
-		flag.Usage()
-		return
-	}
-
-	err = srv.loadKeys()
-	if err != nil {
-		errLog.Fatal(err)
-		return
-	}
-
-	// Get bytes for public commitment to private key
-	GBytes, HBytes, err := crypto.ParseCommitmentFile(srv.CommFilePath)
-	if err != nil {
-		errLog.Fatal(err)
-		return
-	}
-
-	// Retrieve the actual elliptic curve points for the commitment
-	// The commitment should match the current key that is being used for
-	// signing
-	//
-	// We only support curve point commitments for P256-SHA256
-	srv.G, srv.H, err = crypto.RetrieveCommPoints(GBytes, HBytes, srv.signKey)
-	if err != nil {
-		errLog.Fatal(err)
-		return
-	}
-
-	err = srv.ListenAndServe()
-
-	if err != nil {
-		errLog.Fatal(err)
-		return
 	}
 }
